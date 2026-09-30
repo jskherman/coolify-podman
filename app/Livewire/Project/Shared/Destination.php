@@ -38,6 +38,7 @@ class Destination extends Component
 
     public function loadData()
     {
+        $this->authorize('view', $this->resource);
         $all_networks = collect([]);
         $all_networks = $all_networks->push($this->resource->destination);
         $all_networks = $all_networks->merge($this->resource->additional_networks);
@@ -63,7 +64,10 @@ class Destination extends Component
         try {
             $this->authorize('deploy', $this->resource);
             $server = Server::ownedByCurrentTeam()->findOrFail($serverId);
-            StopApplicationOneServer::run($this->resource, $server);
+            $error = StopApplicationOneServer::run($this->resource, $server);
+            if ($error !== null) {
+                return $this->dispatch('error', $error);
+            }
             auditLog('ui.application.destination_stopped', [
                 'team_id' => $this->resource->team()?->id,
                 'application_uuid' => $this->resource->uuid,
@@ -180,7 +184,10 @@ class Destination extends Component
                 return;
             }
             $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
-            StopApplicationOneServer::run($this->resource, $server);
+            $error = StopApplicationOneServer::run($this->resource, $server);
+            if ($error !== null) {
+                return $this->dispatch('error', $error);
+            }
             $this->resource->additional_networks()
                 ->wherePivot('server_id', $server_id)
                 ->detach($network_id);

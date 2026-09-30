@@ -1,0 +1,39 @@
+%% Recovered verbatim from SPEC_Coolify-Podman.md section 8 (2026-09-28).
+%% Standalone companion was absent at bootstrap.
+flowchart TB
+  subgraph ENGINEERING["Engineering boundary"]
+    DEV["Coding agents"] --> REPO["Repository and disposable CI"]
+    REPO --> RELEASE["Reviewed release artifacts"]
+  end
+  subgraph CONTROL["Control plane"]
+    CLIENT["UI, CLI and operational AI"] --> AUTH["Authentication and scoped authorization"]
+    AUTH --> STATE["Application, ingress and recovery specs"]
+    STATE --> POLICY["Policy, plans and durable operations"]
+    POLICY --> EXEC["Typed node executor"]
+  end
+  RELEASE -->|"Verified upgrade"| EXEC
+  subgraph HOST["Managed Linux host"]
+    EXEC -->|"Authenticated operation and generation"| JOURNAL["Node journal and authority checks"]
+    JOURNAL --> ROUTER["Lifecycle owner router"]
+    ROUTER --> Q["Quadlet source and generator"]
+    Q --> UNITS["Generated systemd services"]
+    UNITS --> PODMAN["Rootless Podman workloads"]
+    ROUTER --> COMPAT["Pinned Docker or Podman Compose owner"]
+    JOURNAL --> PROXY["Selected Caddy or Traefik driver"]
+    PROXY --> EDGE["Ingress listener and auth policy"]
+    EDGE -->|"Verification request"| GATE["Optional authentication gateway"]
+    EDGE -->|"Allowed request, explicit private route"| PODMAN
+    EDGE -->|"Allowed request, explicit private route"| COMPAT
+    TIMER["Installed systemd timer"] --> BACKUP["Deterministic backup runner"]
+    JOURNAL --> BACKUP
+    CREDS["Protected local credentials"] --> BACKUP
+    BACKUP --> CAPTURE["Coordinated capture and manifest"]
+    CAPTURE --> RESTIC["Restic repository writer"]
+    BACKUP --> OUTBOX["Durable event outbox"]
+    JOURNAL --> OUTBOX
+  end
+  GATE --> IDP["Identity provider or user directory"]
+  RESTIC --> STORE["S3 repository or optional rclone backend"]
+  STORE --> RESTORE["Isolated restore verifier"]
+  RESTORE --> OUTBOX
+  OUTBOX -->|"Replayable observations"| POLICY

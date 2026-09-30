@@ -211,16 +211,20 @@ test('stopping an application preview quotes the container names from docker ps'
     quotingAssertNoUnquotedName();
 });
 
-test('stopping an application on one server quotes the container names from docker ps', function () {
+test('stopping an application on one server quotes the container names from docker ps', function (bool $nonRoot, string $sudo) {
+    if ($nonRoot) {
+        quotingUseNonRootUser();
+    }
     $application = quotingApplication();
     quotingFakeApplicationContainer(QUOTING_HOSTILE_NAME);
     $quoted = escapeshellarg(QUOTING_HOSTILE_NAME);
 
     StopApplicationOneServer::run($application, $this->server);
 
+    quotingAssertCommandRan("{$sudo}docker stop --timeout=");
     Process::assertRan(fn ($process) => preg_match('/docker stop --timeout=\d+ '.preg_quote($quoted, '/').'\n/', $process->command) === 1);
     quotingAssertNoUnquotedName();
-});
+})->with(['root' => [false, ''], 'non-root' => [true, 'sudo ']]);
 
 test('the non-root sudo parser keeps quoted container names as one argument', function () {
     $server = new Server(['user' => 'ubuntu']);

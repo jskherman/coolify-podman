@@ -172,7 +172,7 @@ it('uses idempotent commands in strict cleanup paths', function () {
         ->toContain('dockerNetworkRemoveCommand($this->destination->network)')
         ->and(file_get_contents($root.'/app/Listeners/ProxyStatusChangedNotification.php'))
         ->toContain("dockerRemoveCommand('coolify-proxy')")
-        ->and(file_get_contents($root.'/app/Actions/Application/StopApplicationOneServer.php'))
+        ->and(file_get_contents($root.'/app/Services/DockerRuntimeDriver.php'))
         ->toContain('dockerRemoveCommand($containerName)');
 });
 

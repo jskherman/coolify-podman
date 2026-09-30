@@ -1,0 +1,24 @@
+# Coolify managed resource 11111111-1111-4111-8111-111111111111
+# Compiler prebuilt-v1.0
+# Spec 5164975fa8c2a9a6f82d456af0b33e699558ca66b5bc280e19a2f7b94c0de11e
+[Unit]
+Description=Coolify application 11111111-1111-4111-8111-111111111111
+
+[Container]
+Image=docker.io/library/busybox@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092
+ContainerName=coolify-11111111-1111-4111-8111-111111111111
+Network=coolify-11111111-1111-4111-8111-111111111111.network
+PublishPort=127.0.0.1:18100:80
+Label=coolify.managed=true
+Label=coolify.resource=11111111-1111-4111-8111-111111111111
+Exec="httpd" "-f" "-p" "80" "-h" "/data"
+Volume=coolify-11111111-1111-4111-8111-111111111111-data.volume:/data:rw
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+MemoryMax=128M
+CPUQuota=100%
+
+[Install]
+WantedBy=default.target

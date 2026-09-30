@@ -1,0 +1,8 @@
+# Coolify managed resource 11111111-1111-4111-8111-111111111111
+# Compiler prebuilt-v1.0
+# Spec 5164975fa8c2a9a6f82d456af0b33e699558ca66b5bc280e19a2f7b94c0de11e
+[Network]
+NetworkName=coolify-11111111-1111-4111-8111-111111111111
+Internal=true
+Label=coolify.managed=true
+Label=coolify.resource=11111111-1111-4111-8111-111111111111

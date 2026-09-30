@@ -47,6 +47,7 @@ class Kernel extends ConsoleKernel
             ->hourly()
             ->when(fn () => config('constants.ssh.mux_enabled') && ! config('constants.coolify.is_windows_docker_desktop'));
         $this->scheduleInstance->command('cleanup:redis --clear-locks')->daily();
+        $this->scheduleInstance->command('node:reconcile')->everyMinute()->onOneServer()->withoutOverlapping();
         $this->scheduleInstance->call(fn () => app(ScheduledJobDeliveryService::class)->deleteOldOccurrences())
             ->name('cleanup:scheduled-job-occurrences')
             ->dailyAt('04:00')

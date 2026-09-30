@@ -14,10 +14,12 @@ use App\Http\Controllers\Api\GitlabController;
 use App\Http\Controllers\Api\HetznerController;
 use App\Http\Controllers\Api\InstanceEmailSettingsController;
 use App\Http\Controllers\Api\IntegrationTokensController;
+use App\Http\Controllers\Api\NodeOperationsController;
 use App\Http\Controllers\Api\NotificationsController;
 use App\Http\Controllers\Api\OtherController;
 use App\Http\Controllers\Api\ProjectController;
 use App\Http\Controllers\Api\ResourcesController;
+use App\Http\Controllers\Api\RuntimeCapabilitiesController;
 use App\Http\Controllers\Api\S3StoragesController;
 use App\Http\Controllers\Api\ScheduledTasksController;
 use App\Http\Controllers\Api\SecurityController;
@@ -155,6 +157,13 @@ Route::group([
     Route::get('/deployments/applications/{uuid}', [DeployController::class, 'get_application_deployments'])->middleware(['api.ability:read']);
 
     Route::get('/servers', [ServersController::class, 'servers'])->middleware(['api.ability:read']);
+    Route::get('/servers/{uuid}/runtime-contexts', [RuntimeCapabilitiesController::class, 'index'])->middleware(['api.ability:read']);
+    Route::post('/servers/{uuid}/runtime-contexts/probe', [RuntimeCapabilitiesController::class, 'probe'])->middleware(['api.ability:write', 'throttle:6,1']);
+    Route::get('/servers/{uuid}/runtime-contexts/{context_uuid}/events', [NodeOperationsController::class, 'events'])->middleware(['api.ability:read']);
+    Route::get('/servers/{uuid}/runtime-contexts/{context_uuid}/operations', [NodeOperationsController::class, 'index'])->middleware(['api.ability:read']);
+    Route::patch('/servers/{uuid}/runtime-contexts/{context_uuid}/executor', [NodeOperationsController::class, 'configure'])->middleware(['api.ability:write', 'throttle:6,1']);
+    Route::post('/servers/{uuid}/runtime-contexts/{context_uuid}/operations', [NodeOperationsController::class, 'store'])->middleware(['api.ability:write', 'throttle:30,1']);
+    Route::post('/servers/{uuid}/runtime-contexts/{context_uuid}/operations/{operation_uuid}/reconcile', [NodeOperationsController::class, 'reconcile'])->middleware(['api.ability:write', 'throttle:30,1']);
     Route::get('/servers/{uuid}', [ServersController::class, 'server_by_uuid'])->middleware(['api.ability:read']);
     Route::get('/servers/{uuid}/domains', [ServersController::class, 'domains_by_server'])->middleware(['api.ability:read']);
     Route::get('/servers/{uuid}/resources', [ServersController::class, 'resources_by_server'])->middleware(['api.ability:read']);

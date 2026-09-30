@@ -1,0 +1,95 @@
+name: Podman fork gates
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@b604ade2a87db23f8871b7182e69ec5e75effb45 # v2
+        with:
+          php-version: '8.5'
+          extensions: mbstring, sqlite3, pdo_sqlite, bcmath, gd, zip, sockets
+          coverage: none
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+      - run: composer install --no-interaction --prefer-dist --no-progress
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+      - run: python3 tests/Scripts/runtime_vm_test.py
+      - run: python3 tests/Scripts/node_executor_test.py
+      - run: python3 tests/Scripts/quadlet_bundle_test.py
+      - run: python3 tests/Scripts/node_activation_test.py
+      - run: python3 tests/Scripts/node_native_test.py
+      - name: Native specification and compiler golden gates
+        run: php artisan test --compact tests/Feature/QuadletCompilerTest.php
+      - name: Docker adapter and authorization regression
+        run: php artisan test --compact tests/Feature/RuntimeDriverTest.php tests/Feature/RuntimeCapabilitiesTest.php tests/Feature/NodeOperationTest.php tests/Feature/NodeActivationTest.php tests/Feature/NodeExecutorTransportTest.php tests/Feature/ContainerNameShellQuotingTest.php tests/Unit/DockerStopCommandTest.php tests/Unit/DockerRemoveWithTimeoutTest.php tests/Unit/RuntimeCapabilityProbeTest.php
+      - run: npx playwright install --with-deps chromium
+      - name: Capability browser gate
+        run: php artisan test --compact tests/v4/Browser/RuntimeCapabilitiesBrowserTest.php
+      - name: Install disposable VM tooling
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+      - name: Boot checksum-pinned disposable systemd fixture
+        run: |
+          scripts/runtime-test-vm start
+          for attempt in $(seq 1 90); do
+            if scripts/runtime-test-vm ssh true; then break; fi
+            sleep 5
+          done
+          scripts/runtime-test-vm ssh cloud-init status --wait
+          scripts/runtime-test-vm ssh dpkg-query -W docker.io podman systemd
+      - name: Real Docker lifecycle gate
+        env:
+          COOLIFY_RUNTIME_VM_TEST: '1'
+        run: php artisan test --compact tests/Feature/RuntimeDriverDockerIntegrationTest.php tests/Feature/RuntimeCapabilitiesIntegrationTest.php
+      - name: Pinned rootless generator gate
+        env:
+          COOLIFY_RUNTIME_VM_TEST: '1'
+        run: php artisan test --compact tests/Feature/QuadletCompilerIntegrationTest.php
+      - name: Rootless ingress and recovery prototypes
+        env:
+          COOLIFY_RUNTIME_VM_TEST: '1'
+        run: |
+          scripts/runtime-test-vm ssh 'DEBIAN_FRONTEND=noninteractive apt-get install -y caddy=2.6.2-12+deb13u1 && systemctl disable --now caddy'
+          python3 tests/Scripts/runtime_prototypes_test.py
+      - name: Restricted node protocol and interruption gates
+        env:
+          COOLIFY_RUNTIME_VM_TEST: '1'
+        run: |
+          scripts/runtime-node-fixture
+          python3 tests/Scripts/node_executor_integration_test.py
+          python3 tests/Scripts/node_executor_interruption_test.py
+          php artisan test --compact tests/Feature/NodeOperationIntegrationTest.php
+          python3 tests/Scripts/node_executor_handoff_test.py
+          php artisan test --compact tests/Feature/NodeRecoveryIntegrationTest.php
+          python3 tests/Scripts/node_executor_outbox_test.py
+          php artisan test --compact tests/Feature/NodeOutboxIntegrationTest.php
+          python3 tests/Scripts/node_executor_identity_test.py
+          php artisan test --compact tests/Feature/NodeIdentityIntegrationTest.php
+          python3 tests/Scripts/node_executor_staging_test.py
+          php artisan test --compact tests/Feature/NodeStagingIntegrationTest.php
+          python3 tests/Scripts/node_executor_staging_interruption_test.py
+          python3 tests/Scripts/node_executor_activation_test.py
+          php artisan test --compact tests/Feature/NodeActivationIntegrationTest.php
+          python3 tests/Scripts/node_executor_boot_test.py
+          php artisan test --compact tests/Feature/NodeBootRecoveryIntegrationTest.php
+          python3 tests/Scripts/node_start_boundary_test.py
+      - name: Fixture state and shutdown
+        if: always()
+        run: |
+          if [ -f storage/app/runtime-test-vm/state.json ]; then
+            scripts/runtime-test-vm status
+            scripts/runtime-test-vm stop
+          fi

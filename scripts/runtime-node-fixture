@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Provision the restricted node protocol only on the recorded disposable VM."""
+import json
+from pathlib import Path
+import subprocess
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / 'storage/app/runtime-test-vm'
+record_path = STATE / 'state.json'
+record = json.loads(record_path.read_text())
+marker = subprocess.check_output([str(ROOT / 'scripts/runtime-test-vm'), 'ssh', 'cat /etc/coolify-disposable-fixture'], text=True).strip()
+assert marker == record['operation_id']
+if 'executor_fixture' in record:
+    assert record['executor_fixture']['state'] == 'provisioned', 'Reconcile interrupted bootstrap before retrying'
+    print('Executor already provisioned; preserving policy and journal')
+else:
+    assert not (STATE / 'node_ed25519').exists(), 'Refusing to replace an unowned test key'
+    record['executor_fixture'] = {'operation_id': marker + '-executor-bootstrap-1',
+                                  'state': 'provisioning', 'resource_id': str(uuid.uuid4())}
+    temporary = record_path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(record, indent=2) + '\n')
+    temporary.replace(record_path)
+    subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(STATE / 'node_ed25519')], check=True)
+    for source in [ROOT / 'scripts/coolify-node-executor.py', ROOT / 'tests/Fixtures/node-executor-bootstrap.py', STATE / 'node_ed25519.pub']:
+        subprocess.run(['scp', '-i', str(STATE / 'id_ed25519'), '-P', str(record['ssh_port']),
+                        '-o', 'BatchMode=yes', '-o', 'UserKnownHostsFile=' + str(STATE / 'known_hosts'),
+                        str(source), 'root@127.0.0.1:/root/' + source.name], check=True)
+    subprocess.run([str(ROOT / 'scripts/runtime-test-vm'), 'ssh',
+                    f'python3 /root/node-executor-bootstrap.py {marker} {record["executor_fixture"]["resource_id"]}'], check=True)
+    record['executor_fixture']['state'] = 'provisioned'
+    temporary.write_text(json.dumps(record, indent=2) + '\n')
+    temporary.replace(record_path)

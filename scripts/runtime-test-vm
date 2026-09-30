@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Disposable software-emulated systemd fixture; never manages existing hosts."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / 'storage/app/runtime-test-vm'
+PROFILE = json.loads((ROOT / '.dev/runtime-vm.json').read_text())
+
+
+def run(*args):
+    subprocess.run([str(arg) for arg in args], check=True)
+
+
+def save(record):
+    temporary = STATE / 'state.tmp'
+    temporary.write_text(json.dumps(record, indent=2) + '\n')
+    temporary.replace(STATE / 'state.json')
+
+
+def monitor(command):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(5)
+        connection.connect(str(STATE / 'qmp.sock'))
+        channel = connection.makefile('rwb')
+        channel.readline()
+        for request in ['qmp_capabilities', command]:
+            channel.write((json.dumps({'execute': request}) + '\n').encode())
+            channel.flush()
+            while True:
+                line = channel.readline()
+                if not line:
+                    raise RuntimeError('QEMU monitor disconnected without an outcome')
+                response = json.loads(line)
+                if 'error' in response:
+                    raise RuntimeError('QEMU monitor rejected observation')
+                if 'return' in response:
+                    break
+        return response['return']
+
+
+def running():
+    record = json.loads((STATE / 'state.json').read_text())
+    if (STATE / 'qmp.sock').exists():
+        observed = monitor('query-name')
+        if observed.get('name') != record['operation_id']:
+            raise RuntimeError('QEMU identity mismatch; refusing to operate')
+        return True
+    if not (STATE / 'qemu.pid').exists():
+        if record['stage'] in ['launching', 'running']:
+            raise RuntimeError('Uncertain fixture state; reconcile the recorded operation before retrying')
+        return False
+    pid = int((STATE / 'qemu.pid').read_text())
+    try:
+        command = Path(f'/proc/{pid}/cmdline').read_bytes()
+    except FileNotFoundError:
+        raise RuntimeError('Recorded PID is not visible; reconcile outside the PID namespace before retrying')
+    if str(STATE / 'disk.qcow2').encode() not in command:
+        raise RuntimeError('PID was reused; refusing to operate on an unrelated process')
+    raise RuntimeError('QEMU process exists without its monitor; refusing duplicate launch')
+
+
+def start(record):
+    if running():
+        record['stage'] = 'running'
+        save(record)
+        print(json.dumps(record))
+        return
+    if record.get('stage') == 'launching':
+        raise RuntimeError('Interrupted launch: reconcile qemu.pid and qmp.sock before retrying')
+    record['stage'] = 'preparing'
+    save(record)
+    base = STATE / 'base.qcow2'
+    if not base.exists():
+        partial = STATE / 'base.download'
+        run('curl', '--fail', '--location', '--retry', '2', '--output', partial, PROFILE['image_url'])
+        with partial.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha512').hexdigest()
+        if digest != PROFILE['image_sha512']:
+            raise RuntimeError('Image checksum mismatch; image will not be booted')
+        partial.replace(base)
+    with base.open('rb') as stream:
+        if hashlib.file_digest(stream, 'sha512').hexdigest() != PROFILE['image_sha512']:
+            raise RuntimeError('Cached image checksum mismatch')
+    if not (STATE / 'id_ed25519').exists():
+        run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', STATE / 'id_ed25519')
+    if not (STATE / 'disk.qcow2').exists():
+        run('qemu-img', 'create', '-f', 'qcow2', '-F', 'qcow2', '-b', base, STATE / 'disk.qcow2', PROFILE['disk_size'])
+    public_key = (STATE / 'id_ed25519.pub').read_text().strip()
+    (STATE / 'user-data').write_text(f'''#cloud-config
+disable_root: false
+ssh_pwauth: false
+users:
+  - name: root
+    ssh_authorized_keys: [{public_key}]
+  - name: operator
+    primary_group: operator
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys: [{public_key}]
+  - name: workload
+    shell: /bin/bash
+    ssh_authorized_keys: [{public_key}]
+packages: [docker.io, podman, uidmap, dbus-user-session, slirp4netns, fuse-overlayfs, sudo, curl]
+package_update: true
+runcmd:
+  - [systemctl, enable, --now, docker]
+  - [loginctl, enable-linger, workload]
+  - [sh, -c, 'echo {record["operation_id"]} > /etc/coolify-disposable-fixture']
+''')
+    (STATE / 'meta-data').write_text(f'instance-id: {record["operation_id"]}\nlocal-hostname: coolify-runtime-test\n')
+    run('genisoimage', '-quiet', '-output', STATE / 'seed.iso', '-volid', 'cidata', '-joliet', '-rock', STATE / 'user-data', STATE / 'meta-data')
+    if 'ssh_port' not in record:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            record['ssh_port'] = listener.getsockname()[1]
+    record['stage'] = 'launching'
+    save(record)
+    run('qemu-system-x86_64', '-name', record['operation_id'], '-accel', 'tcg', '-cpu', 'max',
+        '-m', PROFILE['memory_mib'], '-smp', PROFILE['cpus'], '-display', 'none', '-daemonize',
+        '-drive', f'file={STATE / "disk.qcow2"},if=virtio,format=qcow2',
+        '-drive', f'file={STATE / "seed.iso"},media=cdrom,readonly=on',
+        '-netdev', f'user,id=net0,hostfwd=tcp:127.0.0.1:{record["ssh_port"]}-:22',
+        '-device', 'virtio-net-pci,netdev=net0', '-pidfile', STATE / 'qemu.pid',
+        '-qmp', f'unix:{STATE / "qmp.sock"},server=on,wait=off',
+        '-serial', f'file:{STATE / "serial.log"}')
+    record['stage'] = 'running'
+    save(record)
+    print(json.dumps(record))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['start', 'status', 'ssh', 'stop'])
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE / 'lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state_file = STATE / 'state.json'
+        if state_file.exists():
+            record = json.loads(state_file.read_text())
+        else:
+            if args.action != 'start':
+                raise RuntimeError('No fixture has been provisioned')
+            if (STATE / 'disk.qcow2').exists():
+                raise RuntimeError('Unowned disk exists; refusing adoption')
+            record = {'operation_id': 'coolify-fixture-' + str(uuid.uuid4()), 'profile': PROFILE['profile'], 'stage': 'new'}
+            save(record)
+        if args.action == 'start':
+            start(record)
+        elif args.action == 'status':
+            print(json.dumps({**record, 'process_running': running()}))
+        elif args.action == 'ssh':
+            if not running():
+                raise RuntimeError('Fixture is not running')
+            run('ssh', '-i', STATE / 'id_ed25519', '-p', record['ssh_port'],
+                '-o', 'StrictHostKeyChecking=accept-new', '-o', f'UserKnownHostsFile={STATE / "known_hosts"}',
+                '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes', 'root@127.0.0.1', *args.command)
+        elif args.action == 'stop':
+            if running():
+                monitor('quit')
+            record['stage'] = 'stopped'
+            save(record)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
+        sys.exit(str(error))

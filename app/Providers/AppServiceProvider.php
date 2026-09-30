@@ -5,8 +5,10 @@ namespace App\Providers;
 use App\Auth\Oidc\OidcDiscoveryService;
 use App\Auth\Oidc\OidcTokenValidator;
 use App\Auth\Oidc\Socialite\OidcProvider;
+use App\Contracts\RuntimeDriver;
 use App\Models\PersonalAccessToken;
 use App\Rules\SafeExternalUrl;
+use App\Services\DockerRuntimeDriver;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\DB;
@@ -23,6 +25,7 @@ class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
+        $this->app->bind(RuntimeDriver::class, DockerRuntimeDriver::class);
         $this->app->bind(StripeClient::class, fn () => new StripeClient(config('subscription.stripe_api_key')));
     }
 

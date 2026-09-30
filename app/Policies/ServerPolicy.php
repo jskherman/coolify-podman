@@ -7,6 +7,12 @@ use App\Models\User;
 
 class ServerPolicy
 {
+    public function manageRuntime(User $user, Server $server): bool
+    {
+        return $user->teams()->whereKey($server->team_id)
+            ->wherePivotIn('role', ['admin', 'owner'])->exists();
+    }
+
     /**
      * Determine whether the user can view any models.
      */
