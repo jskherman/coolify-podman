@@ -36,6 +36,10 @@ def cut():
               'selection': native.current(request['resource_id'], policy()['resources'][request['resource_id']]),
               'persistent': native.selection(request['resource_id']).is_symlink(),
               'volatile': native.volatile_selection(request['resource_id']).is_symlink()}
+    if target.startswith('lifecycle_'):
+        record['owner_commands'] = native.run(['/usr/bin/systemctl', '--user', 'show',
+            native.resource_name(request['resource_id']) + '.service',
+            '--property=LoadState,ExecStop,ExecStopPost']).stdout
     path = Path('/var/lib/coolify-node/1001/release-cutpoint-' + fault_id + '.json')
     with path.open('x') as stream:
         json.dump(record, stream)
@@ -50,16 +54,28 @@ def start(resource_id, grant, before_request=None):
         cut()
 native.start = start
 original_commit = native.commit
-def commit(resource_id, bundle_hash, operation_id, grant):
+def commit(resource_id, bundle_hash, operation_id, grant, restore_stopped=False):
     if bundle_hash == request['bundle_hash'] and target == 'accepted_before_publication':
         assert phase()['phase'] == 'committed'
         cut()
-    result = original_commit(resource_id, bundle_hash, operation_id, grant)
+    result = original_commit(resource_id, bundle_hash, operation_id, grant, restore_stopped=restore_stopped)
     if bundle_hash == request['bundle_hash'] and target == 'accepted_after_publication':
         assert phase()['phase'] == 'committed'
         cut()
     return result
 native.commit = commit
+original_prepare = native.prepare_lifecycle
+def prepare(*args):
+    original_prepare(*args)
+    if target == 'lifecycle_prepared':
+        cut()
+native.prepare_lifecycle = prepare
+original_request = native.request_lifecycle
+def lifecycle_request(*args):
+    original_request(*args)
+    if target == 'lifecycle_requested':
+        cut()
+native.request_lifecycle = lifecycle_request
 policy = lambda: node.trusted_policy(Path('/etc/coolify-node/policies/1001.json'))
 try:
     print(node.canonical(executor.execute(request, 'fixture-recovery', policy)), flush=True)
@@ -72,12 +88,14 @@ assert os.getuid() == 0 and sys.flags.isolated
 assert Path('/etc/coolify-disposable-fixture').read_text().strip() == fixture
 assert Path('/etc/coolify-node/fixture-owner').read_text() == fixture
 assert str(uuid.UUID(fault_id)) == fault_id
-assert target in {'accepted_before_publication', 'accepted_after_publication', 'accepted_restart', 'compensating_start'}
+assert target in {'accepted_before_publication', 'accepted_after_publication', 'accepted_restart', 'compensating_start',
+                  'lifecycle_prepared', 'lifecycle_requested'}
 assert hashlib.sha256(Path('/usr/local/libexec/coolify-node-executor.py').read_bytes()).hexdigest() == code_hash
 request = json.load(sys.stdin)
 for field in ['operation_id', 'resource_id', 'idempotency_key']:
     assert str(uuid.UUID(request[field])) == request[field]
-assert request['action'] == 'activate' and request['policy_version'] == 10
+assert request['policy_version'] == 10
+assert request['action'] in ({'start', 'stop', 'restart'} if target.startswith('lifecycle_') else {'activate'})
 policy = json.loads(Path('/etc/coolify-node/policies/1001.json').read_text())
 assert policy['version'] == 10 and policy['resources'][request['resource_id']]['kind'] == 'quadlet'
 path = Path('/etc/coolify-node/release-cutpoint-' + fault_id + '.json')

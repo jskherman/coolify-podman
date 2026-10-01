@@ -73,6 +73,110 @@ class NativeRuntime:
     def selection(self, resource_id):
         return self.home / '.config/containers/systemd' / self.resource_name(resource_id)
 
+    def stopped_path(self, resource_id):
+        self.resource_name(resource_id)
+        return self.directory / ('stopped-' + resource_id + '.json')
+
+    def stop_mask(self, resource_id):
+        return self.home / '.config/systemd/user' / (self.resource_name(resource_id) + '.service')
+
+    def stopped(self, resource_id):
+        path = self.stopped_path(resource_id)
+        if not path.exists() and not path.is_symlink():
+            return None
+        self.protected_directory(self.directory)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'r') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid or info.st_mode & 0o077
+                    or info.st_nlink != 1 or info.st_size > 2048):
+                raise ValueError('Unprotected stopped intent')
+            record = json.load(stream)
+        if (set(record) != {'resource_id', 'operation_id', 'bundle_hash'}
+                or record['resource_id'] != resource_id
+                or str(uuid.UUID(record['operation_id'])) != record['operation_id']
+                or not isinstance(record['bundle_hash'], str)
+                or not re.fullmatch(r'[a-f0-9]{64}', record['bundle_hash'])):
+            raise ValueError('Invalid stopped intent')
+        return record
+
+    def owns_stop_mask(self, resource_id):
+        record = self.stopped(resource_id)
+        mask = self.stop_mask(resource_id)
+        for parent in [self.home, self.home / '.config', self.home / '.config/systemd', mask.parent]:
+            if parent.exists() or parent.is_symlink():
+                self.protected_directory(parent, private=False)
+        if not mask.exists() and not mask.is_symlink():
+            return False
+        info = mask.lstat()
+        if not record or not stat.S_ISLNK(info.st_mode) or info.st_uid != self.uid or os.readlink(mask) != '/dev/null':
+            raise ValueError('Foreign service mask or definition')
+        return True
+
+    def set_stopped(self, resource_id, bundle_hash, operation_id, policy):
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError('Invalid stop operation')
+        if self.current(resource_id, policy) != bundle_hash or bundle_hash is None:
+            raise ValueError('Cannot stop an unselected release')
+        self.load(resource_id, bundle_hash, policy)
+        masked = self.owns_stop_mask(resource_id)
+        record = self.stopped(resource_id)
+        if record and record['bundle_hash'] != bundle_hash:
+            raise ValueError('Stopped release changed')
+        if not record:
+            record = {'resource_id': resource_id, 'operation_id': operation_id, 'bundle_hash': bundle_hash}
+            descriptor, temporary = tempfile.mkstemp(prefix='.stopped-', dir=self.directory)
+            try:
+                with os.fdopen(descriptor, 'w') as stream:
+                    os.fchmod(stream.fileno(), 0o600)
+                    stream.write(json.dumps(record, sort_keys=True, separators=(',', ':')) + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.stopped_path(resource_id))
+                self.bundle_type.sync_directory(self.directory)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        if not masked:
+            mask = self.stop_mask(resource_id)
+            for parent in [self.home / '.config', self.home / '.config/systemd', mask.parent]:
+                self.protected_directory(parent, private=False, create=True)
+            # Never replace another owner's path, even if it appears after validation.
+            mask.symlink_to('/dev/null')
+            self.bundle_type.sync_directory(mask.parent)
+
+    def clear_stopped(self, resource_id):
+        if self.owns_stop_mask(resource_id):
+            mask = self.stop_mask(resource_id)
+            mask.unlink()
+            self.bundle_type.sync_directory(mask.parent)
+        if self.stopped(resource_id):
+            self.stopped_path(resource_id).unlink()
+            self.bundle_type.sync_directory(self.directory)
+
+    def prepare_lifecycle(self, action, resource_id, bundle_hash, operation_id, policy):
+        if action not in {'start', 'stop', 'restart'} or self.pending(resource_id):
+            raise ValueError('Lifecycle conflicts with release publication')
+        if self.current(resource_id, policy) != bundle_hash or bundle_hash is None:
+            raise ValueError('Lifecycle release changed')
+        loaded = self.load(resource_id, bundle_hash, policy)
+        files = self.bundle_type.compile(loaded['spec'], resource_id, policy)
+        self.check_quadlet_sources(resource_id, files)
+        self.check_systemd_sources(resource_id, files, bundle_hash)
+        if action != 'stop':
+            self.reload_verify(resource_id, bundle_hash, policy)
+        self.preflight(resource_id, bundle_hash, policy)
+        if action == 'stop':
+            self.set_stopped(resource_id, bundle_hash, operation_id, policy)
+        else:
+            self.clear_stopped(resource_id)
+            self.reload_verify(resource_id, bundle_hash, policy)
+
+    def request_lifecycle(self, action, resource_id):
+        if action not in {'start', 'stop', 'restart'}:
+            raise ValueError('Invalid lifecycle action')
+        self.run(['/usr/bin/systemctl', '--user', '--no-block', action, self.resource_name(resource_id) + '.service'])
+
     def load(self, resource_id, bundle_hash, policy):
         self.resource_name(resource_id)
         if not isinstance(bundle_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', bundle_hash):
@@ -247,7 +351,7 @@ class NativeRuntime:
         target = self.load(resource_id, bundle_hash, policy)['path']
         self.write_pointer(selected, target)
 
-    def commit(self, resource_id, bundle_hash, operation_id, policy):
+    def commit(self, resource_id, bundle_hash, operation_id, policy, restore_stopped=False):
         pending = self.pending(resource_id)
         if pending and (pending['operation_id'] != operation_id
                         or bundle_hash not in {None, pending['candidate_bundle_hash'], pending['previous_bundle_hash']}):
@@ -255,7 +359,10 @@ class NativeRuntime:
         if self.current(resource_id, policy) != bundle_hash:
             raise ValueError('Cannot commit an unselected release')
         observed = self.inspect(resource_id, policy)
-        if pending and bundle_hash == pending['candidate_bundle_hash'] and (not observed['active'] or not observed['health']):
+        if restore_stopped and (not pending or bundle_hash != pending['previous_bundle_hash']
+                                or not self.owns_stop_mask(resource_id) or observed['active'] or observed['transitioning']):
+            raise ValueError('Stopped compensation lacks its prior release and mask')
+        if pending and bundle_hash == pending['candidate_bundle_hash'] and not restore_stopped and (not observed['active'] or not observed['health']):
             raise ValueError('Cannot boot-publish an unhealthy candidate')
         if bundle_hash:
             target = self.load(resource_id, bundle_hash, policy)['path']
@@ -333,6 +440,8 @@ class NativeRuntime:
             for unit in units:
                 path = root / unit
                 if path.exists() or path.is_symlink():
+                    if path == self.stop_mask(resource_id) and self.owns_stop_mask(resource_id):
+                        continue
                     if selected is None or root != generator or path.is_symlink():
                         raise ValueError('Foreign systemd source shadows managed unit')
 
@@ -365,6 +474,22 @@ class NativeRuntime:
         for unit, content in self.generated(resource_id, bundle_hash, policy).items():
             properties = self.show(unit)
             fragment = Path(f'/run/user/{self.uid}/systemd/generator') / unit
+            if unit == self.stop_mask(resource_id).name and self.owns_stop_mask(resource_id):
+                record = self.stopped(resource_id)
+                if record['bundle_hash'] != bundle_hash or properties.get('DropInPaths'):
+                    raise ValueError('Effective stopped unit differs from its owned mask')
+                if properties.get('LoadState') == 'masked':
+                    if (properties.get('NeedDaemonReload') != 'no'
+                            or properties.get('FragmentPath') not in {'/dev/null', str(self.stop_mask(resource_id))}):
+                        raise ValueError('Effective mask differs from stopped intent')
+                    continue
+                if (properties.get('LoadState') == 'loaded' and properties.get('NeedDaemonReload') in {'yes', 'no'}
+                        and properties.get('FragmentPath') == str(fragment)
+                        and not fragment.is_symlink() and fragment.read_bytes() == content):
+                    # Retain the loaded Quadlet's ExecStop until graceful stop has
+                    # finished; the durable mask already prevents reboot activation.
+                    continue
+                raise ValueError('Loaded stop target differs from the selected Quadlet')
             if (properties.get('LoadState') != 'loaded' or properties.get('NeedDaemonReload') != 'no'
                     or properties.get('DropInPaths') or properties.get('FragmentPath') != str(fragment)
                     or fragment.is_symlink() or fragment.read_bytes() != content):
@@ -451,7 +576,7 @@ class NativeRuntime:
                 connection.close()
         return {'active': active, 'invocation': properties.get('InvocationID', ''),
                 'transitioning': changed_invocation or state in {'activating', 'deactivating', 'reloading'}, 'failed': state == 'failed',
-                'bundle_hash': selected, 'health': health}
+                'bundle_hash': selected, 'health': health, 'boot_enabled': not self.owns_stop_mask(resource_id)}
 
     def preflight(self, resource_id, bundle_hash, policy):
         loaded = self.load(resource_id, bundle_hash, policy)

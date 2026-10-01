@@ -33,6 +33,7 @@ class Native:
         self.boot_selected = None
         self.pending_operation = None
         self.boot_changed = False
+        self.boot_enabled = True
         self.candidate = 'a' * 64
         self.spec = {'image': 'registry.example/image@sha256:' + 'f' * 64,
                      'volumes': [], 'network': {'internal': True}, 'ports': [],
@@ -51,7 +52,7 @@ class Native:
         if bundle_hash is not None and bundle_hash != self.selected:
             raise ValueError('Selected artifact mismatch')
         return {'active': self.active, 'invocation': self.invocation, 'transitioning': False,
-                'failed': self.failed, 'bundle_hash': self.selected,
+                'failed': self.failed, 'bundle_hash': self.selected, 'boot_enabled': self.boot_enabled,
                 'health': self.active and self.healthy and (self.selected != self.candidate or self.candidate_healthy) and not (self.fail_compensation and self.selected != self.candidate)}
 
     def image(self, resource_id, operation_id, spec, policy):
@@ -75,7 +76,7 @@ class Native:
             raise ValueError('Activation lacks pending selection')
         return self.selected is None and self.boot_changed
 
-    def commit(self, resource_id, bundle_hash, operation_id, policy):
+    def commit(self, resource_id, bundle_hash, operation_id, policy, restore_stopped=False):
         if self.pending_operation not in {None, operation_id}:
             raise ValueError('Different operation owns commit')
         if self.boot_selected != bundle_hash:
@@ -83,6 +84,26 @@ class Native:
             self.boot_selected = bundle_hash
         self.pending_operation = None
         return self.inspect(resource_id, policy)
+
+    def clear_stopped(self, resource_id):
+        self.boot_enabled = True
+
+    def set_stopped(self, resource_id, bundle_hash, operation_id, policy):
+        self.boot_enabled = False
+
+    def prepare_lifecycle(self, action, resource_id, bundle_hash, operation_id, policy):
+        self.effects.append('prepare:' + action)
+        if self.selected != bundle_hash:
+            raise ValueError('Release changed')
+        self.boot_enabled = action != 'stop'
+
+    def request_lifecycle(self, action, resource_id):
+        self.effects.append('request:' + action)
+        if action == 'stop':
+            self.active = False
+        else:
+            self.active = True
+            self.invocation = uuid.uuid4().hex
 
     def select(self, resource_id, bundle_hash, policy):
         if self.selected != bundle_hash:
@@ -224,6 +245,22 @@ class NodeActivationTest(unittest.TestCase):
         self.assertEqual(self.native.selected, previous)
         self.assertTrue(self.native.active)
         self.assertEqual(self.run_request(), result)
+
+    def test_failed_deployment_preserves_a_previously_stopped_boot_intent(self):
+        previous = 'b' * 64
+        self.native.selected = previous
+        self.native.boot_enabled = False
+        self.native.active = False
+        self.native.candidate_healthy = False
+        self.candidate_started()
+        self.assertTrue(self.native.boot_enabled)
+        self.expire_activation()
+        result = self.terminal()
+        self.assertEqual(result['status'], 'failed', result)
+        self.assertFalse(self.native.active)
+        self.assertFalse(self.native.boot_enabled)
+        self.assertEqual(self.native.selected, previous)
+        self.assertFalse(result['release']['data_recovery'])
 
     def test_unsafe_data_migration_never_starts_previous_application(self):
         self.native.selected = 'b' * 64

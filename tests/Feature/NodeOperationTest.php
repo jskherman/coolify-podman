@@ -518,3 +518,42 @@ test('recovery adopts validated failed activation and prevents further execution
     expect($target->fresh()->status)->toBe('failed')->and($target->fresh()->isTerminal())->toBeTrue()
         ->and($target->fresh()->result)->toBe($recovered);
 });
+
+test('executor history shows observed boot intent only when the node supplied it', function (array $observed, ?string $label) {
+    $operation = SubmitNodeOperation::run($this->actor, $this->context, $this->input);
+    $operation->update(['status' => 'succeeded', 'result' => ['generation' => 2, 'observed' => $observed]]);
+    $this->actingAs($this->actor);
+    $component = Livewire::test(NodeExecutor::class, ['context' => $this->context]);
+    if ($label === null) {
+        $component->assertDontSee('Observed boot activation:');
+    } else {
+        $component->assertSee('Observed boot activation: '.$label);
+    }
+    $this->team->members()->updateExistingPivot($this->actor->id, ['role' => 'member']);
+    Livewire::test(NodeExecutor::class, ['context' => $this->context])->assertForbidden();
+})->with([
+    'stopped' => [['boot_enabled' => false], 'disabled'],
+    'running' => [['boot_enabled' => true], 'enabled'],
+    'legacy unknown' => [[], null],
+]);
+
+test('recovery sweep observes unresolved native lifecycle within the existing attempt and lease bounds', function (string $action) {
+    $operation = SubmitNodeOperation::run($this->actor, $this->context, [...$this->input, 'action' => $action]);
+    $request = $operation->request;
+    $operation->update(['status' => 'needs_intervention', 'error_code' => 'lifecycle_effect_unresolved', 'attempts' => 1]);
+    Queue::fake();
+    $this->artisan('node:reconcile')->assertSuccessful();
+    Queue::assertPushed(ExecuteNodeOperationJob::class, fn ($job) => $job->operationId === $operation->id);
+    expect($operation->fresh()->request)->toBe($request);
+    foreach ([
+        ['attempts' => 5],
+        ['attempts' => 1, 'error_code' => 'recovery_definition_mismatch'],
+        ['error_code' => 'lifecycle_effect_unresolved', 'lease_expires_at' => now()->addMinute()],
+        ['lease_expires_at' => null, 'status' => 'denied'],
+    ] as $state) {
+        $operation->update($state);
+        Queue::fake();
+        $this->artisan('node:reconcile')->assertSuccessful();
+        Queue::assertNothingPushed();
+    }
+})->with(['start', 'stop', 'restart']);

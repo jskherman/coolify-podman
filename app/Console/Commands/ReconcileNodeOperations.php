@@ -15,7 +15,10 @@ class ReconcileNodeOperations extends Command
 
     public function handle(): int
     {
-        $operations = NodeOperation::query()->whereIn('status', ['queued', 'executing', 'uncertain'])
+        $operations = NodeOperation::query()
+            ->where(fn (Builder $query) => $query->whereIn('status', ['queued', 'executing', 'uncertain'])
+                ->orWhere(fn (Builder $query) => $query->where('status', 'needs_intervention')
+                    ->whereIn('action', ['start', 'stop', 'restart'])->where('error_code', 'lifecycle_effect_unresolved')))
             ->where(fn (Builder $query) => $query->where('attempts', '<', 5)
                 ->orWhere(fn (Builder $query) => $query->where('action', 'activate')->where('status', 'executing')->where('result->status', 'executing')))
             ->where(fn (Builder $query) => $query->whereNull('lease_expires_at')->orWhere('lease_expires_at', '<=', now()))

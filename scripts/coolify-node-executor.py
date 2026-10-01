@@ -374,6 +374,7 @@ class Executor:
                         raise ValueError('Storage or exposure changes require an explicit migration')
                 before = {'phase': 'planned', 'previous_bundle_hash': previous_hash,
                           'before_active': observed['active'], 'before_health': observed['health'],
+                          'before_boot_enabled': observed.get('boot_enabled', True),
                           'definition_hash': self.definition_hash(resource),
                           'no_op': previous_hash == request['bundle_hash'] and observed['active'] and observed['health']}
             except Exception:
@@ -422,11 +423,17 @@ class Executor:
             return denied('observation_unavailable')
         if request['deadline'] <= int(time.time()):
             return denied('deadline_expired')
+        if resource.get('kind') == 'quadlet' and request['action'] in {'start', 'stop', 'restart'}:
+            if before.get('bundle_hash') is None:
+                return denied('no_selected_release')
+            before['phase'] = 'lifecycle_planned'
         with self.db:
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,NULL,?,?)',
                             (request['operation_id'], request['idempotency_key'], resource_id,
                              payload_hash, 'executing', canonical(before), principal, canonical(request)))
         action = request['action']
+        if before.get('phase') == 'lifecycle_planned':
+            return self._reconcile(request, resource, before)
         if action == 'recover':
             return self._reconcile(request, resource, before)
         if action == 'status' or (action == 'start' and before['active']) or (action == 'stop' and not before['active']):
@@ -443,6 +450,8 @@ class Executor:
         return hashlib.sha256(canonical({key: value for key, value in resource.items() if key not in {'generation', '_resource_id', 'native_adapter_sha256'}}).encode()).hexdigest()
 
     def _reconcile(self, request, resource, before):
+        if resource.get('kind') == 'quadlet' and request['action'] in {'start', 'stop', 'restart'} and 'phase' in before:
+            return self._native_lifecycle(request, resource, before)
         if request['action'] == 'activate':
             return self._activate(request, resource, before)
         if request['action'] == 'stage':
@@ -500,6 +509,44 @@ class Executor:
         except Exception:
             pass
         return self._unresolved(request, 'effect_unresolved')
+
+    def _native_lifecycle(self, request, resource, before):
+        if before.get('definition_hash') != self.definition_hash(resource):
+            return self._unresolved(request, 'recovery_definition_mismatch')
+        native = self.runtime.native
+        action = request['action']
+        resource_id = request['resource_id']
+        try:
+            if native.current(resource_id, resource) != before['bundle_hash']:
+                return self._unresolved(request, 'lifecycle_release_changed')
+            if before['phase'] == 'lifecycle_planned':
+                no_op = (not before['transitioning'] and
+                         ((action == 'stop' and not before['active'] and not before['boot_enabled']) or
+                          (action == 'start' and before['active'] and before['boot_enabled'])))
+                if no_op:
+                    observed = native.inspect(resource_id, resource)
+                    if (not observed['transitioning'] and observed['active'] == before['active']
+                            and observed['boot_enabled'] == before['boot_enabled']):
+                        return self._finish(request, observed, changed=False)
+                native.prepare_lifecycle(action, resource_id, before['bundle_hash'], request['operation_id'], resource)
+                self._checkpoint(request, before, 'lifecycle_requested')
+                native.request_lifecycle(action, resource_id)
+            observed = native.inspect(resource_id, resource)
+            converged = (not observed['transitioning'] and
+                         ((action == 'stop' and not observed['active'] and not observed['boot_enabled']) or
+                          (action == 'start' and observed['active'] and observed['boot_enabled']) or
+                          (action == 'restart' and observed['active'] and observed['boot_enabled']
+                           and observed['invocation'] and observed['invocation'] != before['invocation'])))
+            if converged:
+                if action == 'stop':
+                    native.reload_verify(resource_id, before['bundle_hash'], resource)
+                    observed = native.inspect(resource_id, resource)
+                    if observed['active'] or observed['transitioning'] or observed['boot_enabled']:
+                        return self._unresolved(request, 'stop_observation_changed')
+                return self._finish(request, observed, changed=True)
+        except Exception:
+            pass
+        return self._unresolved(request, 'lifecycle_effect_unresolved')
 
     def _checkpoint(self, request, before, phase, **updates):
         before.update(phase=phase, **updates)
@@ -567,6 +614,7 @@ class Executor:
                     self._checkpoint(request, before, 'publishing')
                 elif phase == 'publishing':
                     native.begin_update(resource_id, request['operation_id'], request['bundle_hash'], before['previous_bundle_hash'], resource)
+                    native.clear_stopped(resource_id)
                     if native.current(resource_id, resource) not in {None, before['previous_bundle_hash'], request['bundle_hash']}:
                         raise ValueError('Foreign selection during publication')
                     native.select(resource_id, request['bundle_hash'], resource)
@@ -667,7 +715,12 @@ class Executor:
                         before.pop('compensation_activation_started_at', None)
                         self._checkpoint(request, before, 'compensating_start', compensation_initial_invocation=native.inspect(resource_id, resource)['invocation'])
                         continue
-                    observed = native.commit(resource_id, before['previous_bundle_hash'], request['operation_id'], resource)
+                    restore_stopped = bool(before['previous_bundle_hash'] and not before.get('before_boot_enabled', True))
+                    if restore_stopped:
+                        native.set_stopped(resource_id, before['previous_bundle_hash'], request['operation_id'], resource)
+                        native.reload_verify(resource_id, before['previous_bundle_hash'], resource)
+                    observed = native.commit(resource_id, before['previous_bundle_hash'], request['operation_id'], resource,
+                                             restore_stopped=restore_stopped)
                     return self._finish(request, observed, True,
                                         {'release': self._activation_result(request, before, 'rolled_back', data_recovery=False)}, status='failed')
                 else:

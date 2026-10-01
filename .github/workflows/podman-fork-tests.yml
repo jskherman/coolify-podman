@@ -10,7 +10,7 @@ permissions:
 jobs:
   foundation:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -32,6 +32,7 @@ jobs:
       - run: python3 tests/Scripts/quadlet_bundle_test.py
       - run: python3 tests/Scripts/node_activation_test.py
       - run: python3 tests/Scripts/node_native_test.py
+      - run: python3 tests/Scripts/node_lifecycle_test.py
       - name: Native specification and compiler golden gates
         run: php artisan test --compact tests/Feature/QuadletCompilerTest.php
       - name: Docker adapter and authorization regression
@@ -86,6 +87,9 @@ jobs:
           python3 tests/Scripts/node_executor_boot_test.py
           php artisan test --compact tests/Feature/NodeBootRecoveryIntegrationTest.php
           python3 tests/Scripts/node_start_boundary_test.py
+          python3 tests/Scripts/node_repeat_boot_test.py
+          python3 tests/Scripts/node_persistent_stop_test.py
+          php artisan test --compact tests/Feature/NodePersistentStopIntegrationTest.php
       - name: Fixture state and shutdown
         if: always()
         run: |

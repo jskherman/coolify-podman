@@ -168,6 +168,66 @@ class NativePublicationTest(unittest.TestCase):
             self.runtime.commit(self.resource, self.digest, operation, self.policy)
         self.assertFalse(self.runtime.selection(self.resource).is_symlink())
 
+    def test_manual_stop_mask_is_owned_durable_and_preserves_the_selected_bundle(self):
+        self.runtime.select(self.resource, self.digest, self.policy)
+        operation = str(uuid.uuid4())
+        self.runtime.set_stopped(self.resource, self.digest, operation, self.policy)
+        mask = self.runtime.stop_mask(self.resource)
+        self.assertTrue(mask.is_symlink())
+        self.assertEqual(os.readlink(mask), '/dev/null')
+        self.assertEqual(self.runtime.stopped(self.resource)['operation_id'], operation)
+        self.assertEqual(self.runtime.current(self.resource, self.policy), self.digest)
+        inode = mask.lstat().st_ino
+        self.runtime.set_stopped(self.resource, self.digest, operation, self.policy)
+        self.assertEqual(mask.lstat().st_ino, inode)
+        self.runtime.clear_stopped(self.resource)
+        self.assertFalse(mask.is_symlink())
+        self.assertIsNone(self.runtime.stopped(self.resource))
+        self.assertEqual(self.runtime.current(self.resource, self.policy), self.digest)
+
+    def test_stop_persists_mask_without_reloading_away_the_running_quadlet_execstop(self):
+        self.runtime.select(self.resource, self.digest, self.policy)
+        self.runtime.check_quadlet_sources = lambda *args: None
+        self.runtime.check_systemd_sources = lambda *args: None
+        self.runtime.preflight = lambda *args: None
+        reloads = []
+        self.runtime.reload_verify = lambda *args: reloads.append(args)
+        self.runtime.prepare_lifecycle('stop', self.resource, self.digest, str(uuid.uuid4()), self.policy)
+        self.assertTrue(self.runtime.owns_stop_mask(self.resource))
+        self.assertEqual(reloads, [], 'Reloading a masked active unit removes its Quadlet ExecStop')
+
+    def test_foreign_mask_and_unprotected_stop_record_are_never_adopted(self):
+        self.runtime.select(self.resource, self.digest, self.policy)
+        mask = self.runtime.stop_mask(self.resource)
+        mask.parent.mkdir(parents=True, mode=0o700)
+        mask.parent.parent.chmod(0o700)
+        mask.symlink_to('/dev/null')
+        with self.assertRaises(ValueError):
+            self.runtime.set_stopped(self.resource, self.digest, str(uuid.uuid4()), self.policy)
+        with self.assertRaises(ValueError):
+            self.runtime.clear_stopped(self.resource)
+        self.assertTrue(mask.is_symlink())
+        mask.unlink()
+        self.runtime.set_stopped(self.resource, self.digest, str(uuid.uuid4()), self.policy)
+        self.runtime.stopped_path(self.resource).chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.runtime.clear_stopped(self.resource)
+        self.assertTrue(mask.is_symlink())
+
+    def test_stop_preparation_recovers_missing_mask_but_never_replaces_foreign_content(self):
+        self.runtime.select(self.resource, self.digest, self.policy)
+        operation = str(uuid.uuid4())
+        self.runtime.set_stopped(self.resource, self.digest, operation, self.policy)
+        mask = self.runtime.stop_mask(self.resource)
+        mask.unlink()
+        self.runtime.set_stopped(self.resource, self.digest, operation, self.policy)
+        self.assertEqual(os.readlink(mask), '/dev/null')
+        mask.unlink()
+        mask.write_text('unrelated unit')
+        with self.assertRaises(ValueError):
+            self.runtime.set_stopped(self.resource, self.digest, operation, self.policy)
+        self.assertEqual(mask.read_text(), 'unrelated unit')
+
     def test_closed_backend_time_wait_does_not_block_recreate_but_live_listener_does(self):
         with socket.socket() as server, socket.socket() as client:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

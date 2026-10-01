@@ -27,6 +27,9 @@
                     @if (isset($operation->result['generation']))
                         <p>Observed generation {{ $operation->result['generation'] }}</p>
                     @endif
+                    @if (is_bool(data_get($operation->result, 'observed.boot_enabled')))
+                        <p>Observed boot activation: {{ $operation->result['observed']['boot_enabled'] ? 'enabled' : 'disabled' }}</p>
+                    @endif
                 </div>
                 <div class="flex items-center gap-2">
                     <x-forms.button wire:click="refreshEvents('{{ $operation->resource_id }}')" wire:loading.attr="disabled">Read node events</x-forms.button>
